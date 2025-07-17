@@ -6,6 +6,9 @@ from mcp.server import Server
 from mcp.types import Resource, ResourceTemplate, Tool, TextContent
 from pydantic import AnyUrl
 
+import aiohttp
+from aiohttp import web
+
 
 def get_db_config():
     config = {
@@ -22,13 +25,13 @@ def get_db_config():
     return config
 
 
-app = Server(
+mcp_app = Server(
     name="adb-mysql-mcp-server",
     version="1.0.0"
 )
 
 
-@app.list_resources()
+@mcp_app.list_resources()
 async def list_resources() -> list[Resource]:
     return [
         Resource(
@@ -40,7 +43,7 @@ async def list_resources() -> list[Resource]:
     ]
 
 
-@app.list_resource_templates()
+@mcp_app.list_resource_templates()
 async def list_resource_templates() -> list[ResourceTemplate]:
     return [
         ResourceTemplate(
@@ -64,7 +67,7 @@ async def list_resource_templates() -> list[ResourceTemplate]:
     ]
 
 
-@app.read_resource()
+@mcp_app.read_resource()
 async def read_resource(uri: AnyUrl) -> str:
     config = get_db_config()
     uri_str = str(uri)
@@ -117,7 +120,7 @@ async def read_resource(uri: AnyUrl) -> str:
             conn.close()
 
 
-@app.list_tools()
+@mcp_app.list_tools()
 async def list_tools() -> list[Tool]:
     return [
         Tool(
@@ -165,7 +168,7 @@ async def list_tools() -> list[Tool]:
     ]
 
 
-@app.call_tool()
+@mcp_app.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     """Execute SQL commands."""
     config = get_db_config()
@@ -208,19 +211,58 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             conn.close()
 
 
+async def sse_handler(request):
+    # 设置SSE响应头
+    resp = web.StreamResponse(
+        status=200,
+        reason='OK',
+        headers={
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+        },
+    )
+    await resp.prepare(request)
+    
+    # 创建输入输出流适配器
+    class SSEWriter:
+        def __init__(self, resp):
+            self.resp = resp
+        
+        async def write(self, data):
+            # 将MCP输出包装为SSE事件格式
+            sse_data = f"data: {data}\n\n"
+            await self.resp.write(sse_data.encode('utf-8'))
+    
+    writer = SSEWriter(resp)
+    
+    try:
+        await mcp_app.run(
+            request.content,  # read_stream
+            writer,           # write_stream
+            mcp_app.create_initialization_options()
+        )
+    except Exception as e:
+        await writer.write(f"Error: {str(e)}")
+    finally:
+        await resp.write_eof()
+    
+    return resp
+
 async def main():
-    from mcp.server.stdio import stdio_server
-
-    async with stdio_server() as (read_stream, write_stream):
-        try:
-            await app.run(
-                read_stream,
-                write_stream,
-                app.create_initialization_options()
-            )
-        except Exception as e:
-            raise
-
+    # 创建aiohttp应用
+    web_app = web.Application()
+    web_app.add_routes([web.get('/events', sse_handler)])
+    
+    # 启动服务器
+    runner = web.AppRunner(web_app)
+    await runner.setup()
+    site = web.TCPSite(runner, 'localhost', 3000)
+    await site.start()
+    
+    # 保持服务器运行
+    print("SSE server running on http://localhost:3000/events")
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
     asyncio.run(main())
